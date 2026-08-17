@@ -1,0 +1,219 @@
+# Builds an installable TizenTube Cobalt APK for handhelds.
+#
+# The repo's existing android_27.lts.yaml delegates to main.yaml, which targets
+# Google's self-hosted `chrobalt-linux-runner` fleet and builds through their RBE
+# instance. A fork has neither, so this workflow is a standalone, self-contained
+# path from a bare Linux runner to a signed APK artifact.
+#
+# Build size warning: this compiles Chromium from source with no remote execution.
+# Expect roughly 50-70 GB of disk and, more importantly, a wall time that scales
+# with core count. GitHub's standard 4-core `ubuntu-latest` runner will not finish
+# inside the hard 6-hour job limit; use a larger GitHub-hosted runner or a
+# self-hosted one via the `runner` input.
+
+name: handheld_apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target platform.'
+        required: true
+        type: choice
+        options:
+          - android-arm64
+          - android-arm
+          - android-x86
+        default: android-arm64
+      build_config:
+        description: 'Build config. devel builds fastest; qa and gold are official builds and take considerably longer.'
+        required: true
+        type: choice
+        options:
+          - devel
+          - qa
+          - gold
+        default: devel
+      runner:
+        description: 'Runner label(s). The 4-core ubuntu-latest cannot finish within the 6-hour job limit; point this at a larger or self-hosted runner.'
+        required: true
+        type: string
+        default: ubuntu-latest
+      enable_sccache:
+        description: 'Cache compiler output in the GitHub Actions cache. Only helps on re-runs, and the 10 GB per-repo cache cap means it will not hold a whole Chromium build.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ inputs.platform }}_${{ inputs.build_config }}
+    runs-on: ${{ inputs.runner }}
+    # The GitHub maximum. A from-scratch Chromium build needs every minute of it.
+    timeout-minutes: 360
+    env:
+      # gclient checks for updates on every invocation otherwise, which is noise in CI.
+      DEPOT_TOOLS_UPDATE: 0
+      DEPOT_TOOLS_REPORT_BUILD: 0
+      DEPOT_TOOLS_COLLECT_METRICS: 0
+      DEPOT_TOOLS_METRICS: 0
+      OUT_DIR: out/${{ inputs.platform }}_${{ inputs.build_config }}
+
+    steps:
+      - name: Reclaim disk space
+        shell: bash
+        run: |
+          set -x
+          df -h /
+          # The hosted image ships several toolchains this build has no use for.
+          # Removing them buys back roughly 25 GB, which the Chromium checkout and
+          # its build output need.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # gclient is configured below with --name=src, so the tree has to live at
+          # <workspace>/cobalt/src with the .gclient file one level above it.
+          path: cobalt/src
+          fetch-depth: 1
+
+      - name: Clone depot_tools
+        shell: bash
+        run: |
+          set -ex
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "${GITHUB_WORKSPACE}/cobalt/depot_tools"
+          echo "${GITHUB_WORKSPACE}/cobalt/depot_tools" >> "${GITHUB_PATH}"
+
+      - name: Bootstrap depot_tools python
+        shell: bash
+        run: |
+          set -ex
+          # DEPOT_TOOLS_UPDATE=0 skips the implicit bootstrap, so do it by hand.
+          source "${GITHUB_WORKSPACE}/cobalt/depot_tools/bootstrap_python3" && bootstrap_python3
+          build_telemetry opt-out || true
+
+      - name: Configure gclient
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt"
+          gclient config --name=src "${REPOSITORY}"
+          echo "target_os=['android']" >> .gclient
+          gclient validate
+
+      - name: Sync dependencies
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt"
+          # --no-history and --shallow keep this to the tens of GB rather than
+          # hundreds. Hooks run separately below so a sync failure is easy to tell
+          # apart from a hook failure.
+          gclient sync \
+            --verbose \
+            --shallow \
+            --no-history \
+            --nohooks \
+            --force \
+            --delete_unversioned_trees \
+            --revision "${REF}"
+          df -h /
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt/src"
+          # --unsupported keeps this working when the runner image moves to an
+          # Ubuntu release the script does not yet know about.
+          sudo python3 build/install-build-deps.py --no-prompt --unsupported
+
+      - name: Run hooks
+        shell: bash
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt"
+          gclient runhooks --verbose
+          df -h /
+
+      - name: Set up sccache
+        if: inputs.enable_sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Enable sccache GitHub Actions backend
+        if: inputs.enable_sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
+
+      - name: GN gen
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          BUILD_CONFIG: ${{ inputs.build_config }}
+          ENABLE_SCCACHE: ${{ inputs.enable_sccache }}
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt/src"
+          gn_flags=(--no-rbe)
+          if [[ "${ENABLE_SCCACHE}" == "true" ]]; then
+            gn_flags+=(--use-sccache)
+          fi
+          # --no-rbe is what makes this buildable outside Google's RBE instance: it
+          # leaves use_remoteexec and use_siso unset, so autoninja runs plain local
+          # ninja.
+          cobalt/build/gn.py -p "${PLATFORM}" -C "${BUILD_CONFIG}" "${gn_flags[@]}"
+          gn args --list --short --overrides-only "${OUT_DIR}"
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -ex
+          cd "${GITHUB_WORKSPACE}/cobalt/src"
+          # Only the APK, not cobalt:gn_all: the CI default pulls in every test
+          # binary in the tree and multiplies both build time and disk use.
+          time autoninja -C "${OUT_DIR}" cobalt/android:cobalt_apk
+          df -h /
+
+      - name: Show sccache stats
+        if: inputs.enable_sccache
+        shell: bash
+        run: sccache --show-stats || true
+
+      - name: List build output
+        shell: bash
+        run: |
+          set -x
+          cd "${GITHUB_WORKSPACE}/cobalt/src"
+          ls -la "${OUT_DIR}/apks" || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tizentube-handheld-${{ inputs.platform }}-${{ inputs.build_config }}
+          if-no-files-found: error
+          path: |
+            cobalt/src/${{ env.OUT_DIR }}/apks/*.apk
+            cobalt/src/${{ env.OUT_DIR }}/*_apk/*.apk
