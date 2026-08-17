@@ -27,6 +27,12 @@
     <!-- Some UI elements, like the settings menu during video playback, rely on the background being transparent. -->
     <item name="android:background">@android:color/transparent</item>
 
+    <!-- Second line of defence against the full-screen white wash described in
+         FocusHighlightUtil: the framework tints its default focus highlight with this attribute, so
+         making it transparent renders the highlight invisible even on a view the recursive opt-out
+         has not reached. The app has no Android widgets whose ripples this would otherwise affect. -->
+    <item name="android:colorControlHighlight">@android:color/transparent</item>
+
     <!-- Handhelds: when the system bars transiently reappear out of immersive mode, let them float
          over the app rather than shrinking it. Televisions have no system bars, so this is inert
          there. The display cutout mode is set on the window in CobaltActivity#onCreate, which keeps
