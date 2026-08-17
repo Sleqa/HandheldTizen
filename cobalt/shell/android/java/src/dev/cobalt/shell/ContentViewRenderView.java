@@ -6,6 +6,8 @@ package dev.cobalt.shell;
 
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.os.Build;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -26,6 +28,16 @@ import org.jni_zero.NativeMethods;
  */
 @JNINamespace("cobalt")
 public class ContentViewRenderView extends FrameLayout {
+    /**
+     * Receives touch input that landed on the rendered web contents. Cobalt does not use
+     * Chromium's ContentView, so this view is the only place in the hierarchy where touch
+     * coordinates are already relative to the web contents' container.
+     */
+    public interface TouchHandler {
+        /** Returns whether the event was consumed. */
+        boolean onTouchEvent(MotionEvent event);
+    }
+
     // The native side of this object.
     private long mNativeContentViewRenderView;
     private WindowAndroid mWindowAndroid;
@@ -35,6 +47,8 @@ public class ContentViewRenderView extends FrameLayout {
 
     private int mWidth;
     private int mHeight;
+
+    private TouchHandler mTouchHandler;
 
     /**
      * Constructs a new ContentViewRenderView.
@@ -46,8 +60,36 @@ public class ContentViewRenderView extends FrameLayout {
     public ContentViewRenderView(Context context) {
         super(context);
 
+        // This view is full-screen and has no background describing a focused state, so Android
+        // would paint its translucent-white default focus highlight over the whole app the moment
+        // the window leaves touch mode. See FocusHighlightUtil.
+        disableDefaultFocusHighlight(this);
+
         mSurfaceBridge = createSurfaceBridge();
         mSurfaceBridge.initialize(this);
+    }
+
+    /**
+     * Sets the handler that receives touch input landing on the web contents, or null to ignore
+     * touch entirely.
+     */
+    public void setTouchHandler(TouchHandler touchHandler) {
+        mTouchHandler = touchHandler;
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        TouchHandler touchHandler = mTouchHandler;
+        if (touchHandler != null && touchHandler.onTouchEvent(event)) {
+            return true;
+        }
+        return super.onTouchEvent(event);
+    }
+
+    static void disableDefaultFocusHighlight(View view) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            view.setDefaultFocusHighlightEnabled(false);
+        }
     }
 
     protected SurfaceBridge createSurfaceBridge() {
@@ -237,6 +279,7 @@ public class ContentViewRenderView extends FrameLayout {
         protected void initialize(ContentViewRenderView renderView) {
             mSurfaceView = renderView.createSurfaceView(renderView.getContext());
             mSurfaceView.setZOrderMediaOverlay(true);
+            disableDefaultFocusHighlight(mSurfaceView);
 
             renderView.addView(mSurfaceView,
                     new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,

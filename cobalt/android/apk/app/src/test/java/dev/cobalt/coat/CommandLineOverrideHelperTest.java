@@ -186,6 +186,28 @@ public class CommandLineOverrideHelperTest {
     }
 
     @Test
+    public void testFlagOverrides_DeviceScaleFactorOverride() {
+        CommandLineOverrideHelper.CommandLineOverrideHelperParams params =
+            new CommandLineOverrideHelper.CommandLineOverrideHelperParams(
+                true, /* commandLineArgs= */ null, "1.5");
+        CommandLineOverrideHelper.getFlagOverrides(params);
+
+        Assert.assertEquals(
+            "1.5", CommandLine.getInstance().getSwitchValue("force-device-scale-factor"));
+    }
+
+    @Test
+    public void testFlagOverrides_DeviceScaleFactorDefaultsToOne() {
+        CommandLineOverrideHelper.CommandLineOverrideHelperParams params =
+            new CommandLineOverrideHelper.CommandLineOverrideHelperParams(
+                true, /* commandLineArgs= */ null, /* deviceScaleFactor= */ null);
+        CommandLineOverrideHelper.getFlagOverrides(params);
+
+        Assert.assertEquals(
+            "1", CommandLine.getInstance().getSwitchValue("force-device-scale-factor"));
+    }
+
+    @Test
     public void testFlagOverrides_FeaturesWithValues() {
         String[] commandLineArgs = {"--enable-features=TestFeature1=value1;TestFeature2=value2"};
         CommandLineOverrideHelper.CommandLineOverrideHelperParams params =

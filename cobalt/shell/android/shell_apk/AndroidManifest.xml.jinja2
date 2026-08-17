@@ -70,9 +70,17 @@
                   android:windowSoftInputMode="adjustResize"
                   android:supportsPictureInPicture="true"
                   android:hardwareAccelerated="true"
+                  {# The UI is authored for a 16:9 television, so keep it landscape on handhelds
+                     while still honouring a 180 degree flip. Televisions are landscape anyway. #}
+                  android:screenOrientation="sensorLandscape"
                   android:exported="true">
             <meta-data android:name="cobalt.APP_URL" android:value="https://www.youtube.com/tv?additionalDataUrl=http://localhost:8012/apps/YouTube"/>
             <meta-data android:name="cobalt.ENABLE_SPLASH_SCREEN" android:value="true"/>
+            {# Two optional handheld overrides, both chosen automatically when absent:
+               cobalt.TOUCH_NAVIGATION  HYBRID (taps click, drags move focus) | DPAD | NATIVE | OFF.
+                                        Defaults to HYBRID on touch devices, OFF on televisions.
+               cobalt.GAMEPAD_AS_REMOTE Map gamepad buttons and sticks onto remote keys.
+                                        Defaults to true off-TV. #}
             <meta-data android:name="com.google.android.tv.pip.category" android:value="communication" />
             <meta-data android:name="cobalt.EVERGREEN_LITE" android:value="false"/>
             {# ENABLE_FEATURES accepts a semi-colon-separated list of Chromium features. #}

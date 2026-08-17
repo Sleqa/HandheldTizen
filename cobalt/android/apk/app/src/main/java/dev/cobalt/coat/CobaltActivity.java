@@ -31,6 +31,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup.LayoutParams;
@@ -57,6 +58,8 @@ import dev.cobalt.shell.ShellManager;
 import dev.cobalt.shell.ShellManagerJni;
 import dev.cobalt.shell.StartupGuard;
 import dev.cobalt.util.DisplayUtil;
+import dev.cobalt.util.FocusHighlightUtil;
+import dev.cobalt.util.HandheldDisplayUtil;
 import dev.cobalt.util.JavaSwitches;
 import dev.cobalt.util.Log;
 import java.util.ArrayList;
@@ -87,6 +90,10 @@ public abstract class CobaltActivity extends Activity {
   private static final String META_DATA_APP_URL = "cobalt.APP_URL";
   private static final String META_DATA_ENABLE_SPLASH_SCREEN = "cobalt.ENABLE_SPLASH_SCREEN";
   private static final String META_DATA_ENABLE_FEATURES = "cobalt.ENABLE_FEATURES";
+  // How touchscreen input is translated for the TV web app. See TouchNavigationHelper.Mode.
+  private static final String META_DATA_TOUCH_NAVIGATION = "cobalt.TOUCH_NAVIGATION";
+  // Whether gamepad buttons act as remote keys. See GamepadRemoteMapper.
+  private static final String META_DATA_GAMEPAD_AS_REMOTE = "cobalt.GAMEPAD_AS_REMOTE";
   private static final String YOUTUBE_URL = "https://www.youtube.com/tv";
   private static final String COBALT_USING_ANDROID_OVERLAY = "cobalt-using-android-overlay";
 
@@ -109,6 +116,10 @@ public abstract class CobaltActivity extends Activity {
 
   @SuppressWarnings("unused")
   private CobaltA11yHelper mA11yHelper;
+
+  // Set on handhelds; null on televisions, which keep the upstream gamepad behaviour. The touch
+  // helper needs no field: the ContentViewRenderView it is attached to owns it.
+  @Nullable private GamepadRemoteMapper mGamepadRemoteMapper;
 
   private VideoSurfaceView mVideoSurfaceView;
 
@@ -187,6 +198,26 @@ public abstract class CobaltActivity extends Activity {
     return args.toArray(new String[0]);
   }
 
+  /**
+   * Returns the value for --force-device-scale-factor, or null to leave the television default of
+   * 1 alone.
+   *
+   * <p>The web app is authored for a 720p television. On a handheld panel a scale factor of 1 means
+   * one CSS pixel per physical pixel, which on a 1920x1080 seven-inch screen renders the whole TV
+   * UI at roughly a third of its intended physical size. Scaling so the panel's short edge is 720
+   * CSS pixels tall restores the intended proportions.
+   */
+  @Nullable
+  protected String getDeviceScaleFactorOverride() {
+    if (HandheldDisplayUtil.isTelevision(this)) {
+      return null;
+    }
+    float scale = HandheldDisplayUtil.computeDeviceScaleFactor(this);
+    String formatted = HandheldDisplayUtil.formatDeviceScaleFactor(scale);
+    Log.i(TAG, "Handheld display detected; using device scale factor " + formatted);
+    return formatted;
+  }
+
   // Initially copied from ContentShellActiviy.java
   protected void createContent(final Bundle savedInstanceState) {
     StartupGuard.getInstance().setStartupMilestone(1);
@@ -212,7 +243,7 @@ public abstract class CobaltActivity extends Activity {
 
       CommandLineOverrideHelper.getFlagOverrides(
           new CommandLineOverrideHelper.CommandLineOverrideHelperParams(
-              VersionInfo.isOfficialBuild(), commandLineArgs));
+              VersionInfo.isOfficialBuild(), commandLineArgs, getDeviceScaleFactorOverride()));
     }
     mIsCobaltUsingAndroidOverlay = CommandLine.getInstance().hasSwitch(COBALT_USING_ANDROID_OVERLAY);
 
@@ -268,6 +299,7 @@ public abstract class CobaltActivity extends Activity {
         mShellManager.getContentViewRenderView().getSurfaceView());
     mA11yHelper = new CobaltA11yHelper(this,
         mShellManager.getContentViewRenderView().getSurfaceView());
+    initializeHandheldInput();
 
     if (mStartupUrl == null || mStartupUrl.isEmpty()) {
       String[] args = getStarboardBridge().getArgs();
@@ -310,6 +342,52 @@ public abstract class CobaltActivity extends Activity {
               }
             });
 
+  }
+
+  /**
+   * Sets up touch and gamepad input for handhelds.
+   *
+   * <p>Both are no-ops on televisions, which have neither a touchscreen nor a need to reinterpret
+   * gamepad buttons, so the upstream behaviour there is unchanged.
+   */
+  private void initializeHandheldInput() {
+    boolean isTelevision = HandheldDisplayUtil.isTelevision(this);
+    Bundle metaData = getActivityMetaData();
+
+    TouchNavigationHelper.Mode defaultTouchMode =
+        (isTelevision || !HandheldDisplayUtil.hasTouchScreen(this))
+            ? TouchNavigationHelper.Mode.OFF
+            : TouchNavigationHelper.Mode.HYBRID;
+    TouchNavigationHelper.Mode touchMode =
+        TouchNavigationHelper.Mode.fromString(
+            metaData == null ? null : metaData.getString(META_DATA_TOUCH_NAVIGATION),
+            defaultTouchMode);
+
+    if (touchMode != TouchNavigationHelper.Mode.OFF) {
+      mShellManager
+          .getContentViewRenderView()
+          .setTouchHandler(
+              new TouchNavigationHelper(
+                  this, touchMode, this::injectRemoteKey, this::getActiveWebContents));
+    }
+
+    boolean gamepadAsRemote =
+        metaData == null
+            ? !isTelevision
+            : metaData.getBoolean(META_DATA_GAMEPAD_AS_REMOTE, !isTelevision);
+    if (gamepadAsRemote) {
+      mGamepadRemoteMapper = new GamepadRemoteMapper(this::injectRemoteKey);
+    }
+  }
+
+  /**
+   * Dispatches a synthetic remote key press to the web app, as if it had arrived from a physical
+   * remote. Used by the touch and gamepad translation layers.
+   */
+  private void injectRemoteKey(int keyCode) {
+    long eventTime = SystemClock.uptimeMillis();
+    onKeyDown(keyCode, new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_DOWN, keyCode, 0));
+    onKeyUp(keyCode, new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_UP, keyCode, 0));
   }
 
   // Initially copied from ContentShellActiviy.java
@@ -374,6 +452,11 @@ public abstract class CobaltActivity extends Activity {
     // If input is a from a gamepad button, it shouldn't be dispatched to IME which incorrectly
     // consumes the event as a VKEY_UNKNOWN
     if (KeyEvent.isGamepadButton(keyCode) || keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+      int remoteKeyCode = mapGamepadButton(keyCode);
+      if (remoteKeyCode != KeyEvent.KEYCODE_UNKNOWN) {
+        return dispatchKeyEventToIme(remoteKeyCode, KeyEvent.ACTION_DOWN)
+            || super.onKeyDown(keyCode, event);
+      }
       return super.onKeyDown(keyCode, event);
     }
     return dispatchKeyEventToIme(keyCode, KeyEvent.ACTION_DOWN) || super.onKeyDown(keyCode, event);
@@ -382,12 +465,36 @@ public abstract class CobaltActivity extends Activity {
   @Override
   public boolean onKeyUp(int keyCode, KeyEvent event) {
     if (KeyEvent.isGamepadButton(keyCode) || keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+      int remoteKeyCode = mapGamepadButton(keyCode);
+      if (remoteKeyCode != KeyEvent.KEYCODE_UNKNOWN) {
+        return dispatchKeyEventToIme(remoteKeyCode, KeyEvent.ACTION_UP)
+            || super.onKeyUp(keyCode, event);
+      }
       return super.onKeyUp(keyCode, event);
     }
     if (keyCode == KeyEvent.KEYCODE_BACK) {
       mPhysicalBackKeyPressed = false;
     }
     return dispatchKeyEventToIme(keyCode, KeyEvent.ACTION_UP) || super.onKeyUp(keyCode, event);
+  }
+
+  /**
+   * Returns the remote key a gamepad button stands in for, or {@link KeyEvent#KEYCODE_UNKNOWN} when
+   * gamepad remapping is off or the button has no remote equivalent.
+   */
+  private int mapGamepadButton(int keyCode) {
+    if (mGamepadRemoteMapper == null) {
+      return KeyEvent.KEYCODE_UNKNOWN;
+    }
+    return GamepadRemoteMapper.mapButton(keyCode);
+  }
+
+  @Override
+  public boolean onGenericMotionEvent(MotionEvent event) {
+    if (mGamepadRemoteMapper != null && mGamepadRemoteMapper.onGenericMotionEvent(event)) {
+      return true;
+    }
+    return super.onGenericMotionEvent(event);
   }
 
   // Initially copied from ContentShellActiviy.java
@@ -458,6 +565,14 @@ public abstract class CobaltActivity extends Activity {
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
     super.onCreate(savedInstanceState);
+
+    // Give the app the whole panel: hide the system bars and let the window draw into any display
+    // cutout, so a phone's status and navigation bars do not eat into the 16:9 UI.
+    HandheldDisplayUtil.applyImmersiveFullscreen(this);
+
+    // Stop Android painting its default focus highlight, a translucent white wash that would
+    // otherwise cover the entire window as soon as a controller is used. See FocusHighlightUtil.
+    FocusHighlightUtil.disableDefaultFocusHighlight(getWindow().getDecorView());
 
     // Use a random check to run the StartupGuard logic only a certain percentage of the time.
     if (Math.random() < STARTUP_GUARD_PROBABILITY) {
@@ -592,8 +707,22 @@ public abstract class CobaltActivity extends Activity {
   }
 
   @Override
+  public void onWindowFocusChanged(boolean hasFocus) {
+    super.onWindowFocusChanged(hasFocus);
+    if (hasFocus) {
+      // Sticky immersive mode is transient: the system bars come back on their own after a swipe,
+      // and dialogs or the IME can clear the flags entirely, so re-assert them on regaining focus.
+      HandheldDisplayUtil.applyImmersiveFullscreen(this);
+    }
+  }
+
+  @Override
   protected void onPause() {
     mPhysicalBackKeyPressed = false;
+    if (mGamepadRemoteMapper != null) {
+      // Drop any direction the stick was held in, so auto-repeat does not keep firing.
+      mGamepadRemoteMapper.reset();
+    }
     CobaltContentBrowserClient.dispatchBlur();
     super.onPause();
   }

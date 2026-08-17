@@ -27,6 +27,14 @@
     <!-- Some UI elements, like the settings menu during video playback, rely on the background being transparent. -->
     <item name="android:background">@android:color/transparent</item>
 
+    <!-- Handhelds: when the system bars transiently reappear out of immersive mode, let them float
+         over the app rather than shrinking it. Televisions have no system bars, so this is inert
+         there. The display cutout mode is set on the window in CobaltActivity#onCreate, which keeps
+         it in one place and avoids an API-level-qualified resource directory. -->
+    <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    <item name="android:statusBarColor">@android:color/transparent</item>
+    <item name="android:navigationBarColor">@android:color/transparent</item>
+
     <item name="android:dialogTheme">@style/FullscreenDialogTheme</item>
   </style>
 

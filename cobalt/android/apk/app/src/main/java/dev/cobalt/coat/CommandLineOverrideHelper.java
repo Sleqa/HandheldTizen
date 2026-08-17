@@ -31,17 +31,34 @@ import org.chromium.base.CommandLine;
 public final class CommandLineOverrideHelper {
     private CommandLineOverrideHelper() {} // Prevent instantiation.
 
+    private static final String DEVICE_SCALE_FACTOR_SWITCH = "--force-device-scale-factor=";
+
     /** Param class to simplify #getFlagOverrides method signature */
     public static class CommandLineOverrideHelperParams {
         public CommandLineOverrideHelperParams(
             boolean isOfficialBuild,
             String[] commandLineArgs) {
+            this(isOfficialBuild, commandLineArgs, /* deviceScaleFactor= */ null);
+        }
+
+        /**
+         * @param deviceScaleFactor Value for --force-device-scale-factor, or null to keep the
+         *     television default of 1. Handhelds pass a larger factor so that the web app's
+         *     authored 720p layout fills the panel instead of being rendered at one CSS pixel per
+         *     physical pixel.
+         */
+        public CommandLineOverrideHelperParams(
+            boolean isOfficialBuild,
+            String[] commandLineArgs,
+            String deviceScaleFactor) {
             mIsOfficialBuild = isOfficialBuild;
             mCommandLineArgs = commandLineArgs;
+            mDeviceScaleFactor = deviceScaleFactor;
         }
 
         private boolean mIsOfficialBuild;
         private String[] mCommandLineArgs;
+        private String mDeviceScaleFactor;
     }
 
     // This can be returned as a list, since it does not need to be a single
@@ -56,8 +73,9 @@ public final class CommandLineOverrideHelper {
         paramOverrides.add("--force-video-overlays");
         // Autoplay video with url.
         paramOverrides.add("--autoplay-policy=no-user-gesture-required");
-        // Disable rescaling Webpage.
-        paramOverrides.add("--force-device-scale-factor=1");
+        // Disable rescaling Webpage. Overridden per-device by
+        // CommandLineOverrideHelperParams#mDeviceScaleFactor on handhelds.
+        paramOverrides.add(DEVICE_SCALE_FACTOR_SWITCH + "1");
         // Enable low end device mode.
         paramOverrides.add("--enable-low-end-device-mode");
         // Disables RGBA_4444 textures which
@@ -130,6 +148,21 @@ public final class CommandLineOverrideHelper {
         return paramOverrides;
     }
 
+    /**
+     * Replaces the value of an already-defaulted switch in place, so that the switch is only ever
+     * appended to the command line once.
+     */
+    private static void replaceSwitch(
+        List<String> overrides, String switchPrefix, String value) {
+        for (int i = 0; i < overrides.size(); i++) {
+            if (overrides.get(i).startsWith(switchPrefix)) {
+                overrides.set(i, switchPrefix + value);
+                return;
+            }
+        }
+        overrides.add(switchPrefix + value);
+    }
+
     public static void getFlagOverrides(
         CommandLineOverrideHelperParams params) {
         List<String> cliOverrides =
@@ -144,6 +177,11 @@ public final class CommandLineOverrideHelper {
             getDefaultBlinkEnableFeatureOverridesList();
 
         if (params != null) {
+            if (params.mDeviceScaleFactor != null) {
+                replaceSwitch(
+                    cliOverrides, DEVICE_SCALE_FACTOR_SWITCH, params.mDeviceScaleFactor);
+            }
+
             if (!params.mIsOfficialBuild) {
                 cliOverrides.add(
                   "--remote-allow-origins="
