@@ -39,22 +39,28 @@ on:
         required: true
         type: string
         default: ubuntu-latest
+      timeout_minutes:
+        description: 'Job timeout. GitHub-hosted runners are capped at 360 no matter what is set here; self-hosted runners can go far higher, which is the only way a from-scratch build finishes.'
+        required: false
+        type: string
+        default: '360'
       enable_sccache:
-        description: 'Cache compiler output in the GitHub Actions cache. Only helps on re-runs, and the 10 GB per-repo cache cap means it will not hold a whole Chromium build.'
+        description: 'Cache compiler output in the GitHub Actions cache. Pointless on a self-hosted runner, where the out/ directory already persists between runs.'
         required: false
         type: boolean
         default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a build in flight. A multi-hour job must not be killed because
+  # something else touched the branch while it was running.
+  cancel-in-progress: false
 
 jobs:
   build:
     name: ${{ inputs.platform }}_${{ inputs.build_config }}
     runs-on: ${{ inputs.runner }}
-    # The GitHub maximum. A from-scratch Chromium build needs every minute of it.
-    timeout-minutes: 360
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     env:
       # gclient checks for updates on every invocation otherwise, which is noise in CI.
       DEPOT_TOOLS_UPDATE: 0
@@ -64,7 +70,55 @@ jobs:
       OUT_DIR: out/${{ inputs.platform }}_${{ inputs.build_config }}
 
     steps:
+      - name: Preflight
+        shell: bash
+        run: |
+          set -e
+          cores=$(nproc)
+          ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+          echo "Runner: ${{ runner.environment }} | cores: ${cores} | RAM: ${ram_gb} GB"
+          df -h .
+
+          # Fail now rather than four hours from now with a bare ENOSPC.
+          if ! command -v sudo >/dev/null 2>&1; then
+            echo "::error::sudo is required to install build dependencies."
+            exit 1
+          fi
+          if ! sudo -n true 2>/dev/null; then
+            echo "::error::sudo needs a password. Give the runner user passwordless sudo (NOPASSWD in /etc/sudoers.d) or the dependency install will hang forever waiting on a prompt nobody is there to answer."
+            exit 1
+          fi
+          if [[ "${ram_gb}" -lt 8 ]]; then
+            echo "::error::Only ${ram_gb} GB RAM. Linking Chromium needs several GB per link job and will be OOM-killed below 8 GB. On WSL2, raise the memory limit in %UserProfile%\\.wslconfig."
+            exit 1
+          fi
+
+          # A rough guide to how long this will take, so a doomed run is obvious
+          # from the first few seconds of the log rather than at the timeout.
+          echo "::notice::Estimated build time at ${cores} cores: roughly $(( 32 / (cores > 0 ? cores : 1) )) to $(( 64 / (cores > 0 ? cores : 1) )) hours from cold."
+          if [[ "${{ runner.environment }}" == "github-hosted" && "${cores}" -le 4 ]]; then
+            echo "::warning::A ${cores}-core hosted runner cannot finish a cold Chromium build inside GitHub's hard 6-hour job limit. This run will validate sync, hooks and gn gen, then be killed mid-compile."
+          fi
+
+      - name: Check free disk
+        shell: bash
+        run: |
+          set -e
+          avail_gb=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+          echo "Free disk on the workspace volume: ${avail_gb} GB"
+          # Source plus synced deps is roughly 40 GB, build output another 20-40 GB.
+          if [[ "${avail_gb}" -lt 40 ]]; then
+            echo "::error::${avail_gb} GB free is not enough to even finish syncing. Need 100 GB or more for a comfortable build."
+            exit 1
+          fi
+          if [[ "${avail_gb}" -lt 100 ]]; then
+            echo "::warning::${avail_gb} GB free. A cold build wants 100 GB or more; this may run out of disk during linking."
+          fi
+
       - name: Reclaim disk space
+        # Only meaningful on GitHub's images, which ship toolchains this build has
+        # no use for. On a self-hosted runner these paths are somebody's system.
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: |
           set -x
@@ -92,14 +146,24 @@ jobs:
           # <workspace>/cobalt/src with the .gclient file one level above it.
           path: cobalt/src
           fetch-depth: 1
+          # Do not git-clean the workspace. out/ is untracked, so cleaning would
+          # throw away every object file from a previous attempt; leaving it means
+          # a re-run after a timeout or a transient failure resumes where it left
+          # off instead of starting from zero. Only matters on a self-hosted
+          # runner, where the workspace survives between runs.
+          clean: false
 
       - name: Clone depot_tools
         shell: bash
         run: |
           set -ex
-          git clone --depth 1 \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "${GITHUB_WORKSPACE}/cobalt/depot_tools"
+          # Re-runs on a self-hosted runner already have it.
+          if [[ ! -d "${GITHUB_WORKSPACE}/cobalt/depot_tools/.git" ]]; then
+            rm -rf "${GITHUB_WORKSPACE}/cobalt/depot_tools"
+            git clone --depth 1 \
+              https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+              "${GITHUB_WORKSPACE}/cobalt/depot_tools"
+          fi
           echo "${GITHUB_WORKSPACE}/cobalt/depot_tools" >> "${GITHUB_PATH}"
 
       - name: Bootstrap depot_tools python
@@ -117,8 +181,14 @@ jobs:
         run: |
           set -ex
           cd "${GITHUB_WORKSPACE}/cobalt"
-          gclient config --name=src "${REPOSITORY}"
-          echo "target_os=['android']" >> .gclient
+          # Idempotent, so a re-run on a self-hosted runner does not clobber a
+          # good .gclient with a duplicate target_os line.
+          if [[ ! -f .gclient ]]; then
+            gclient config --name=src "${REPOSITORY}"
+          fi
+          if ! grep -q "target_os" .gclient; then
+            echo "target_os=['android']" >> .gclient
+          fi
           gclient validate
 
       - name: Sync dependencies
@@ -202,12 +272,18 @@ jobs:
         shell: bash
         run: sccache --show-stats || true
 
-      - name: List build output
+      - name: Report build output
         shell: bash
         run: |
-          set -x
+          set -e
           cd "${GITHUB_WORKSPACE}/cobalt/src"
           ls -la "${OUT_DIR}/apks" || true
+          apk=$(find "${OUT_DIR}/apks" -name '*.apk' | head -1)
+          if [[ -z "${apk}" ]]; then
+            echo "::error::Build reported success but produced no APK under ${OUT_DIR}/apks."
+            exit 1
+          fi
+          echo "::notice::Built $(basename "${apk}") ($(du -h "${apk}" | cut -f1))"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
